@@ -1,10 +1,11 @@
-#include <wayfire/plugin.hpp>
+#include <wayfire/singleton-plugin.hpp>
 #include <wayfire/output.hpp>
 #include <wayfire/signal-definitions.hpp>
 #include <wayfire/render-manager.hpp>
 #include <wayfire/workspace-manager.hpp>
 #include <wayfire/debug.hpp>
 #include <type_traits>
+#include <map>
 #include <wayfire/core.hpp>
 #include "system_fade.hpp"
 #include "basic_animations.hpp"
@@ -16,21 +17,36 @@ void animation_base::init(wayfire_view, int, wf_animation_type) {}
 bool animation_base::step() {return false;}
 animation_base::~animation_base() {}
 
+struct animation_list_t
+{
+    /**
+     * A list of views with their respective outputs which are being animated.
+     * Note that the output value is just the output the view was last animated
+     * on, so it may be a dangling pointer.
+     */
+    std::map<wayfire_view, wf::output_t*> last_output;
+};
+
+static constexpr const char* custom_data_id = "animation-hook";
+
 /* Represents an animation running for a specific view
  * animation_t is which animation to use (i.e fire, zoom, etc). */
+struct animation_hook_base : public wf::custom_data_t
+{
+    virtual void stop_hook(bool) = 0;
+    virtual ~animation_hook_base() = default;
+};
+
 template<class animation_t>
-struct animation_hook : public wf::custom_data_t
+struct animation_hook : public animation_hook_base
 {
     static_assert(std::is_base_of<animation_base, animation_t>::value,
             "animation_type must be derived from animation_base!");
 
-    static constexpr const char* custom_data_id = "animation-hook";
-
     wf_animation_type type;
-    std::unique_ptr<animation_base> animation;
-
     wayfire_view view;
-    wf::output_t *output;
+    wf::output_t *current_output = nullptr;
+    std::unique_ptr<animation_base> animation;
 
     /* Update animation right before each frame */
     wf::effect_hook_t update_animation_hook = [=] ()
@@ -43,20 +59,34 @@ struct animation_hook : public wf::custom_data_t
             stop_hook(false);
     };
 
-    /* If the view changes outputs, we need to stop animating, because our animations,
-     * hooks, etc are bound to the last output. */
-    wf::signal_callback_t view_detached = [=] (wf::signal_data_t *data)
+    /**
+     * Switch the output the view is being animated on, and update the lastly
+     * animated output in the global list.
+     */
+    void set_output(wf::output_t *new_output)
     {
-        if (get_signaled_view(data) == view)
-            stop_hook(true);
-    };
+        if (current_output)
+            current_output->render->rem_effect(&update_animation_hook);
+
+        if (new_output)
+        {
+            new_output->render->add_effect(&update_animation_hook,
+                wf::OUTPUT_EFFECT_PRE);
+            auto& global_list = wf::get_core().get_data<
+                wf::detail::singleton_data_t<animation_list_t>>()->ptr;
+            global_list.last_output[view] = new_output;
+        }
+
+        current_output = new_output;
+    }
+
+    wf::signal_connection_t on_set_output = {[this] (wf::signal_data_t *data)
+    { set_output(get_signaled_output(data)); }};
 
     animation_hook(wayfire_view view, int duration, wf_animation_type type)
     {
         this->type = type;
         this->view = view;
-        this->output = view->get_output();
-
         if (type == ANIMATION_TYPE_UNMAP)
         {
             view->take_ref();
@@ -66,15 +96,13 @@ struct animation_hook : public wf::custom_data_t
         animation = std::make_unique<animation_t> ();
         animation->init(view, duration, type);
 
-        output->render->add_effect(&update_animation_hook, wf::OUTPUT_EFFECT_PRE);
-
-        /* We listen for just the detach-view signal. If the state changes in
-         * some other way (i.e view unmapped while map animation), the hook
-         * will be overridden by wayfire_animation::set_animation() */
-        output->connect_signal("detach-view", &view_detached);
+        set_output(view->get_output());
+        /* Animation is driven by the output render cycle the view is on.
+         * Thus, we need to keep in sync with the current output. */
+        view->connect_signal("set-output", &on_set_output);
     }
 
-    void stop_hook(bool detached)
+    void stop_hook(bool detached) override
     {
         /* We don't want to change the state of the view if it was detached */
         if (type == ANIMATION_TYPE_MINIMIZE && !detached)
@@ -86,15 +114,26 @@ struct animation_hook : public wf::custom_data_t
 
     ~animation_hook()
     {
+        /**
+         * Order here is very important.
+         * After doing unref() the view will be potentially destroyed.
+         * Hence, we want to deinitialize everything else before that.
+         */
+        set_output(nullptr);
+        on_set_output.disconnect();
+        this->animation.reset();
+
+        // remove from list
+        auto& global_list = wf::get_core().get_data<
+            wf::detail::singleton_data_t<animation_list_t>>()->ptr;
+        global_list.last_output.erase(view);
+
         if (type == ANIMATION_TYPE_UNMAP)
             view->unref();
-
-        output->render->rem_effect(&update_animation_hook);
-        output->disconnect_signal("detach-view", &view_detached);
     }
 };
 
-class wayfire_animation : public wf::plugin_interface_t
+class wayfire_animation : public wf::singleton_plugin_t<animation_list_t, true>
 {
     wf::option_wrapper_t<std::string> open_animation{"animate/open_animation"};
     wf::option_wrapper_t<std::string> close_animation{"animate/close_animation"};
@@ -116,6 +155,8 @@ class wayfire_animation : public wf::plugin_interface_t
     public:
     void init() override
     {
+        singleton_plugin_t::init();
+
         grab_interface->name = "animate";
         grab_interface->capabilities = 0;
 
@@ -169,7 +210,7 @@ class wayfire_animation : public wf::plugin_interface_t
     {
         view->store_data(
             std::make_unique<animation_hook<animation_t>> (view, duration, type),
-            animation_hook<animation_t>::custom_data_id);
+            custom_data_id);
     }
 
     /* TODO: enhance - add more animations */
@@ -227,6 +268,19 @@ class wayfire_animation : public wf::plugin_interface_t
         output->disconnect_signal("pre-unmap-view", &on_view_unmapped);
         output->disconnect_signal("start-rendering", &on_render_start);
         output->disconnect_signal("view-minimize-request", &on_minimize_request);
+
+        /* Clear up all active animations on the current output */
+        auto list = this->get_instance().last_output;
+        for (auto pair : list)
+        {
+            if (pair.second == this->output)
+            {
+                pair.first->get_data<animation_hook_base>(custom_data_id)
+                    ->stop_hook(true);
+            }
+        }
+
+        singleton_plugin_t::fini();
     }
 };
 
