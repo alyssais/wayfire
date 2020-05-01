@@ -3,6 +3,7 @@
 #include <wayfire/signal-definitions.hpp>
 #include <wayfire/render-manager.hpp>
 #include <wayfire/workspace-manager.hpp>
+#include <wayfire/nonstd/noncopyable.hpp>
 #include <wayfire/debug.hpp>
 #include <type_traits>
 #include <map>
@@ -17,17 +18,7 @@ void animation_base::init(wayfire_view, int, wf_animation_type) {}
 bool animation_base::step() {return false;}
 animation_base::~animation_base() {}
 
-struct animation_list_t
-{
-    /**
-     * A list of views with their respective outputs which are being animated.
-     * Note that the output value is just the output the view was last animated
-     * on, so it may be a dangling pointer.
-     */
-    std::map<wayfire_view, wf::output_t*> last_output;
-};
-
-static constexpr const char* custom_data_id = "animation-hook";
+static constexpr const char* animate_custom_data_id = "animation-hook";
 
 /* Represents an animation running for a specific view
  * animation_t is which animation to use (i.e fire, zoom, etc). */
@@ -72,9 +63,6 @@ struct animation_hook : public animation_hook_base
         {
             new_output->render->add_effect(&update_animation_hook,
                 wf::OUTPUT_EFFECT_PRE);
-            auto& global_list = wf::get_core().get_data<
-                wf::detail::singleton_data_t<animation_list_t>>()->ptr;
-            global_list.last_output[view] = new_output;
         }
 
         current_output = new_output;
@@ -109,7 +97,7 @@ struct animation_hook : public animation_hook_base
             view->set_minimized(true);
 
         /* Will also delete this */
-        view->erase_data(custom_data_id);
+        view->erase_data(animate_custom_data_id);
     }
 
     ~animation_hook()
@@ -124,16 +112,39 @@ struct animation_hook : public animation_hook_base
         this->animation.reset();
 
         // remove from list
-        auto& global_list = wf::get_core().get_data<
-            wf::detail::singleton_data_t<animation_list_t>>()->ptr;
-        global_list.last_output.erase(view);
-
         if (type == ANIMATION_TYPE_UNMAP)
             view->unref();
     }
 };
 
-class wayfire_animation : public wf::singleton_plugin_t<animation_list_t, true>
+static void cleanup_views_on_output(wf::output_t *output)
+{
+    for (auto& view : wf::get_core().get_all_views())
+    {
+        auto wo = view->get_output();
+        if (wo != output && output)
+            continue;
+
+        if (view->has_data(animate_custom_data_id))
+        {
+            view->get_data<animation_hook_base>(
+                animate_custom_data_id)->stop_hook(true);
+        }
+    }
+}
+
+/**
+ * Cleanup when the last animate plugin is unloaded.
+ */
+struct animation_global_cleanup_t : public noncopyable_t
+{
+    ~animation_global_cleanup_t()
+    {
+        cleanup_views_on_output(nullptr);
+    }
+};
+
+class wayfire_animation : public wf::singleton_plugin_t<animation_global_cleanup_t, true>
 {
     wf::option_wrapper_t<std::string> open_animation{"animate/open_animation"};
     wf::option_wrapper_t<std::string> close_animation{"animate/close_animation"};
@@ -210,7 +221,7 @@ class wayfire_animation : public wf::singleton_plugin_t<animation_list_t, true>
     {
         view->store_data(
             std::make_unique<animation_hook<animation_t>> (view, duration, type),
-            custom_data_id);
+            animate_custom_data_id);
     }
 
     /* TODO: enhance - add more animations */
@@ -270,16 +281,7 @@ class wayfire_animation : public wf::singleton_plugin_t<animation_list_t, true>
         output->disconnect_signal("view-minimize-request", &on_minimize_request);
 
         /* Clear up all active animations on the current output */
-        auto list = this->get_instance().last_output;
-        for (auto pair : list)
-        {
-            if (pair.second == this->output)
-            {
-                pair.first->get_data<animation_hook_base>(custom_data_id)
-                    ->stop_hook(true);
-            }
-        }
-
+        cleanup_views_on_output(output);
         singleton_plugin_t::fini();
     }
 };
